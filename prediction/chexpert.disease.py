@@ -18,19 +18,30 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 
 image_size = (224, 224)
-num_classes = 14
-batch_size = 150
+batch_size = 64
 epochs = 20
 num_workers = 4
-img_data_dir = '<path_to_data>/CheXpert-v1.0/'
+img_data_dir = '/work3/ninwe/dataset/'
+model_name = 'densenet' # 'densenet' or 'resnet'
+single_label = None
+num_classes = 14 if single_label == None else 1
+lr=1e-4
 
+run_config = '{}-sl{}-ep{}-lr{}'.format(model_name,str(single_label),epochs,lr)
+
+def get_cur_version(dir_path):
+    i = 0
+    while os.path.exists(dir_path+'/version_{}'.format(i)):
+        i+=1
+    return i
 
 class CheXpertDataset(Dataset):
-    def __init__(self, csv_file_img, image_size, augmentation=False, pseudo_rgb = True):
+    def __init__(self, csv_file_img, image_size, augmentation=False, pseudo_rgb = True,single_label=None):
         self.data = pd.read_csv(csv_file_img)
         self.image_size = image_size
         self.do_augment = augmentation
         self.pseudo_rgb = pseudo_rgb
+        self.single_label = single_label
 
         self.labels = [
             'No Finding',
@@ -47,6 +58,8 @@ class CheXpertDataset(Dataset):
             'Pleural Other',
             'Fracture',
             'Support Devices']
+        if self.single_label is not None:
+            self.labels = [self.labels[self.single_label]]
 
         self.augment = T.Compose([
             T.RandomHorizontalFlip(p=0.5),
@@ -88,7 +101,7 @@ class CheXpertDataset(Dataset):
 
 
 class CheXpertDataModule(pl.LightningDataModule):
-    def __init__(self, csv_train_img, csv_val_img, csv_test_img, image_size, pseudo_rgb, batch_size, num_workers):
+    def __init__(self, csv_train_img, csv_val_img, csv_test_img, image_size, pseudo_rgb, batch_size, num_workers,single_label=None):
         super().__init__()
         self.csv_train_img = csv_train_img
         self.csv_val_img = csv_val_img
@@ -97,9 +110,9 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
 
-        self.train_set = CheXpertDataset(self.csv_train_img, self.image_size, augmentation=True, pseudo_rgb=pseudo_rgb)
-        self.val_set = CheXpertDataset(self.csv_val_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb)
-        self.test_set = CheXpertDataset(self.csv_test_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb)
+        self.train_set = CheXpertDataset(self.csv_train_img, self.image_size, augmentation=True, pseudo_rgb=pseudo_rgb,single_label=single_label)
+        self.val_set = CheXpertDataset(self.csv_val_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb,single_label=single_label)
+        self.test_set = CheXpertDataset(self.csv_test_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb,single_label=single_label)
 
         print('#train: ', len(self.train_set))
         print('#val:   ', len(self.val_set))
@@ -116,8 +129,9 @@ class CheXpertDataModule(pl.LightningDataModule):
 
 
 class ResNet(pl.LightningModule):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes,lr=0.001):
         super().__init__()
+        self.lr=lr
         self.num_classes = num_classes
         self.model = models.resnet34(pretrained=True)
         # freeze_model(self.model)
@@ -137,7 +151,7 @@ class ResNet(pl.LightningModule):
         for param in self.parameters():
             if param.requires_grad == True:
                 params_to_update.append(param)
-        optimizer = torch.optim.Adam(params_to_update, lr=0.001)
+        optimizer = torch.optim.Adam(params_to_update, lr=self.lr)
         return optimizer
 
     def unpack_batch(self, batch):
@@ -153,8 +167,8 @@ class ResNet(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.process_batch(batch)
         self.log('train_loss', loss)
-        grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
-        self.logger.experiment.add_image('images', grid, self.global_step)
+        #grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
+        #self.logger.experiment.add_image('images', grid, self.global_step)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -167,8 +181,9 @@ class ResNet(pl.LightningModule):
 
 
 class DenseNet(pl.LightningModule):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes,lr=0.001):
         super().__init__()
+        self.lr=lr
         self.num_classes = num_classes
         self.model = models.densenet121(pretrained=True)
         # freeze_model(self.model)
@@ -188,7 +203,7 @@ class DenseNet(pl.LightningModule):
         for param in self.parameters():
             if param.requires_grad == True:
                 params_to_update.append(param)
-        optimizer = torch.optim.Adam(params_to_update, lr=0.001)
+        optimizer = torch.optim.Adam(params_to_update, lr=self.lr)
         return optimizer
 
     def unpack_batch(self, batch):
@@ -204,8 +219,8 @@ class DenseNet(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.process_batch(batch)
         self.log('train_loss', loss)
-        grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
-        self.logger.experiment.add_image('images', grid, self.global_step)
+        #grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
+        #self.logger.experiment.add_image('images', grid, self.global_step)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -282,19 +297,26 @@ def main(hparams):
                               image_size=image_size,
                               pseudo_rgb=True,
                               batch_size=batch_size,
-                              num_workers=num_workers)
+                              num_workers=num_workers,
+                              single_label=single_label)
 
     # model
-    model_type = DenseNet
-    model = model_type(num_classes=num_classes)
+    if model_name == 'densenet':
+        model_type = DenseNet
+    elif model_name == 'resnet':
+        model_type = ResNet
+    model = model_type(num_classes=num_classes,lr=lr)
 
     # Create output directory
-    out_name = 'densenet-all'
-    out_dir = 'chexpert/disease/' + out_name
+    out_dir = '/work3/ninwe/run/chexpert/disease/' + run_config
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-    temp_dir = os.path.join(out_dir, 'temp')
+    cur_version = get_cur_version(out_dir)
+
+    temp_dir = os.path.join(out_dir, 'temp_version_{}'.format(cur_version))
+
+    #temp_dir = os.path.join(out_dir, 'temp')
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
 
@@ -310,7 +332,7 @@ def main(hparams):
         log_every_n_steps = 5,
         max_epochs=epochs,
         gpus=hparams.gpus,
-        logger=TensorBoardLogger('chexpert/disease', name=out_name),
+        logger=TensorBoardLogger('/work3/ninwe/run/chexpert/disease/', name=run_config,version=cur_version),
     )
     trainer.logger._default_hp_metric = False
     trainer.fit(model, data)
@@ -332,7 +354,8 @@ def main(hparams):
     df_logits = pd.DataFrame(data=logits_val, columns=cols_names_logits)
     df_targets = pd.DataFrame(data=targets_val, columns=cols_names_targets)
     df = pd.concat([df, df_logits, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'predictions.val.csv'), index=False)
+    df.to_csv(os.path.join(out_dir, 'predictions.val.version_{}.csv'.format(cur_version)), index=False)
+
 
     print('TESTING')
     preds_test, targets_test, logits_test = test(model, data.test_dataloader(), device)
@@ -340,7 +363,8 @@ def main(hparams):
     df_logits = pd.DataFrame(data=logits_test, columns=cols_names_logits)
     df_targets = pd.DataFrame(data=targets_test, columns=cols_names_targets)
     df = pd.concat([df, df_logits, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'predictions.test.csv'), index=False)
+    df.to_csv(os.path.join(out_dir, 'predictions.test.version_{}.csv'.format(cur_version)), index=False)
+
 
     print('EMBEDDINGS')
 
@@ -350,13 +374,13 @@ def main(hparams):
     df = pd.DataFrame(data=embeds_val)
     df_targets = pd.DataFrame(data=targets_val, columns=cols_names_targets)
     df = pd.concat([df, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'embeddings.val.csv'), index=False)
+    df.to_csv(os.path.join(out_dir, 'embeddings.val.version_{}.csv'.format(cur_version)), index=False)
 
     embeds_test, targets_test = embeddings(model, data.test_dataloader(), device)
     df = pd.DataFrame(data=embeds_test)
     df_targets = pd.DataFrame(data=targets_test, columns=cols_names_targets)
     df = pd.concat([df, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'embeddings.test.csv'), index=False)
+    df.to_csv(os.path.join(out_dir, 'embeddings.test.version_{}.csv'.format(cur_version)), index=False)
 
 
 if __name__ == '__main__':
@@ -364,5 +388,8 @@ if __name__ == '__main__':
     parser.add_argument('--gpus', default=1)
     parser.add_argument('--dev', default=0)
     args = parser.parse_args()
-
-    main(args)
+    
+    print('CONFIG: {}'.format(run_config))
+    exp_num = 5
+    for i in tqdm(range(exp_num)):
+        main(args)
