@@ -1,4 +1,9 @@
 import os
+
+import sys
+sys.path.append('../../chexploration')
+from prediction.dataloader import CheXpertDataResampleModule,CheXpertDataset,CheXpertDataModule,CheXpertGIDataModule
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,17 +22,57 @@ from skimage.io import imsave
 from tqdm import tqdm
 from argparse import ArgumentParser
 
+from torchmetrics import Accuracy,AUROC
+from torchmetrics.classification import MultilabelAUROC
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+import shutil
+
 image_size = (224, 224)
 batch_size = 64
 epochs = 20
-num_workers = 4
+num_workers = 2
 img_data_dir = '/work3/ninwe/dataset/'
-model_name = 'densenet' # 'densenet' or 'resnet'
+model_name = 'resnet' # 'densenet' or 'resnet'
+model_scale = '50' # resnet: 18,34,50,101,152
+                   # densenet: 121,161,169,201
+                   #
+
+view_position='all'
+gender = 'None' #'F','M',None
 single_label = None
 num_classes = 14 if single_label == None else 1
-lr=1e-4
+lr=1e-6
 
-run_config = '{}-sl{}-ep{}-lr{}'.format(model_name,str(single_label),epochs,lr)
+
+pretrained = True
+augmentation = True
+csv_file_img = '../datafiles/chexpert/'+'chexpert.sample.allrace.csv'
+
+gi_split=True
+fold_nums=np.arange(0,20)
+
+
+resam=False
+female_perc_in_training_set = [0,50,100]#
+random_state_set = np.arange(0,10)
+num_per_patient = 1
+disease_list=['Pneumothorax','Pneumonia','Cardiomegaly']
+#['Enlarged Cardiomediastinum','Cardiomegaly','Lung Opacity','Lung Lesion']
+# chose_disease_str =  'Pneumothorax' #'Pneumonia','Pneumothorax'
+random_state = 2022
+if resam: num_classes = 1
+# print('multi label training')
+# num_classes = len(DISEASE_LABELS)
+isMultilabel = True if num_classes!=1 else False
+
+save_model_para = False
+loss_func_type='BCE'
+
+
+
+
+
+
 
 def get_cur_version(dir_path):
     i = 0
@@ -35,108 +80,32 @@ def get_cur_version(dir_path):
         i+=1
     return i
 
-class CheXpertDataset(Dataset):
-    def __init__(self, csv_file_img, image_size, augmentation=False, pseudo_rgb = True,single_label=None):
-        self.data = pd.read_csv(csv_file_img)
-        self.image_size = image_size
-        self.do_augment = augmentation
-        self.pseudo_rgb = pseudo_rgb
-        self.single_label = single_label
-
-        self.labels = [
-            'No Finding',
-            'Enlarged Cardiomediastinum',
-            'Cardiomegaly',
-            'Lung Opacity',
-            'Lung Lesion',
-            'Edema',
-            'Consolidation',
-            'Pneumonia',
-            'Atelectasis',
-            'Pneumothorax',
-            'Pleural Effusion',
-            'Pleural Other',
-            'Fracture',
-            'Support Devices']
-        if self.single_label is not None:
-            self.labels = [self.labels[self.single_label]]
-
-        self.augment = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomApply(transforms=[T.RandomAffine(degrees=15, scale=(0.9, 1.1))], p=0.5),
-        ])
-
-        self.samples = []
-        for idx, _ in enumerate(tqdm(range(len(self.data)), desc='Loading Data')):
-            img_path = img_data_dir + self.data.loc[idx, 'path_preproc']
-            img_label = np.zeros(len(self.labels), dtype='float32')
-            for i in range(0, len(self.labels)):
-                img_label[i] = np.array(self.data.loc[idx, self.labels[i].strip()] == 1, dtype='float32')
-
-            sample = {'image_path': img_path, 'label': img_label}
-            self.samples.append(sample)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, item):
-        sample = self.get_sample(item)
-
-        image = torch.from_numpy(sample['image']).unsqueeze(0)
-        label = torch.from_numpy(sample['label'])
-
-        if self.do_augment:
-            image = self.augment(image)
-
-        if self.pseudo_rgb:
-            image = image.repeat(3, 1, 1)
-
-        return {'image': image, 'label': label}
-
-    def get_sample(self, item):
-        sample = self.samples[item]
-        image = imread(sample['image_path']).astype(np.float32)
-
-        return {'image': image, 'label': sample['label']}
-
-
-class CheXpertDataModule(pl.LightningDataModule):
-    def __init__(self, csv_train_img, csv_val_img, csv_test_img, image_size, pseudo_rgb, batch_size, num_workers,single_label=None):
-        super().__init__()
-        self.csv_train_img = csv_train_img
-        self.csv_val_img = csv_val_img
-        self.csv_test_img = csv_test_img
-        self.image_size = image_size
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-
-        self.train_set = CheXpertDataset(self.csv_train_img, self.image_size, augmentation=True, pseudo_rgb=pseudo_rgb,single_label=single_label)
-        self.val_set = CheXpertDataset(self.csv_val_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb,single_label=single_label)
-        self.test_set = CheXpertDataset(self.csv_test_img, self.image_size, augmentation=False, pseudo_rgb=pseudo_rgb,single_label=single_label)
-
-        print('#train: ', len(self.train_set))
-        print('#val:   ', len(self.val_set))
-        print('#test:  ', len(self.test_set))
-
-    def train_dataloader(self):
-        return DataLoader(self.train_set, self.batch_size, shuffle=True, num_workers=self.num_workers)
-
-    def val_dataloader(self):
-        return DataLoader(self.val_set, self.batch_size, shuffle=False, num_workers=self.num_workers)
-
-    def test_dataloader(self):
-        return DataLoader(self.test_set, self.batch_size, shuffle=False, num_workers=self.num_workers)
 
 
 class ResNet(pl.LightningModule):
-    def __init__(self, num_classes,lr=0.001):
+    def __init__(self, num_classes,lr,pretrained,model_scale):
         super().__init__()
         self.lr=lr
         self.num_classes = num_classes
-        self.model = models.resnet34(pretrained=True)
+        self.pretrained= pretrained
+        self.model_scale=model_scale
+
+        if self.model_scale == '18':
+            self.model = models.resnet18(pretrained=self.pretrained)
+        elif self.model_scale == '34':
+            self.model = models.resnet34(pretrained=self.pretrained)
+        elif self.model_scale == '50':
+            self.model = models.resnet50(pretrained=self.pretrained)
         # freeze_model(self.model)
         num_features = self.model.fc.in_features
         self.model.fc = nn.Linear(num_features, self.num_classes)
+
+        if self.num_classes == 1:
+            self.accu_func = Accuracy(task="binary", num_labels=num_classes)
+            self.auroc_func = AUROC(task='binary', num_labels=num_classes, average='macro', thresholds=None)
+        elif self.num_classes > 1:
+            self.accu_func = Accuracy(task="multilabel", num_labels=num_classes)
+            self.auroc_func = MultilabelAUROC(num_labels=num_classes, average='macro', thresholds=None)
 
     def remove_head(self):
         num_features = self.model.fc.in_features
@@ -162,26 +131,34 @@ class ResNet(pl.LightningModule):
         out = self.forward(img)
         prob = torch.sigmoid(out)
         loss = F.binary_cross_entropy(prob, lab)
-        return loss
+
+        multi_accu = self.accu_func(prob, lab)
+        multi_auroc = self.auroc_func(prob,lab.long())
+        return loss,multi_accu,multi_auroc
 
     def training_step(self, batch, batch_idx):
-        loss = self.process_batch(batch)
+        loss,multi_accu,multi_auroc = self.process_batch(batch)
         self.log('train_loss', loss)
-        #grid = torchvision.utils.make_grid(batch['image'][0:4, ...], nrow=2, normalize=True)
-        #self.logger.experiment.add_image('images', grid, self.global_step)
+        self.log('train_accu', multi_accu)
+        self.log('train_auroc', multi_auroc)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self.process_batch(batch)
+        loss, multi_accu, multi_auroc = self.process_batch(batch)
         self.log('val_loss', loss)
+        self.log('val_accu', multi_accu)
+        self.log('val_auroc', multi_auroc)
 
     def test_step(self, batch, batch_idx):
-        loss = self.process_batch(batch)
+        loss,multi_accu,multi_auroc = self.process_batch(batch)
         self.log('test_loss', loss)
+        self.log('test_accu', multi_accu)
+        self.log('test_auroc', multi_auroc)
 
 
 class DenseNet(pl.LightningModule):
-    def __init__(self, num_classes,lr=0.001):
+    def __init__(self, num_classes,lr):
         super().__init__()
         self.lr=lr
         self.num_classes = num_classes
@@ -285,51 +262,141 @@ def embeddings(model, data_loader, device):
     return embeds.cpu().numpy(), targets.cpu().numpy()
 
 
-def main(hparams):
+def main(hparams,female_perc_in_training=None,random_state=None,chose_disease_str=None,fold_num=None):
 
     # sets seeds for numpy, torch, python.random and PYTHONHASHSEED.
     pl.seed_everything(42, workers=True)
 
-    # data
-    data = CheXpertDataModule(csv_train_img='../datafiles/chexpert/chexpert.sample.train.csv',
-                              csv_val_img='../datafiles/chexpert/chexpert.sample.val.csv',
-                              csv_test_img='../datafiles/chexpert/chexpert.sample.test.csv',
-                              image_size=image_size,
-                              pseudo_rgb=True,
-                              batch_size=batch_size,
-                              num_workers=num_workers,
-                              single_label=single_label)
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
+    print('DEVICE:{}'.format(device))
 
-    # model
-    if model_name == 'densenet':
-        model_type = DenseNet
-    elif model_name == 'resnet':
-        model_type = ResNet
-    model = model_type(num_classes=num_classes,lr=lr)
 
-    # Create output directory
+
+    if resam:
+        run_config = '{}{}-lr{}-ep{}-pt{}-aug{}-{}%female-D{}-npp{}-ml{}-rs{}-imgs{}_mpara{}'.format(model_name,
+                                                                                                    model_scale, lr,
+                                                                                                    epochs,
+                                                                                                    int(pretrained),
+                                                                                                    int(augmentation),
+                                                                                                    female_perc_in_training,
+                                                                                                    chose_disease_str,
+                                                                                                    num_per_patient,
+                                                                                                    int(isMultilabel),
+                                                                                                    random_state,
+                                                                                                    image_size[0],
+                                                                                                    int(save_model_para))
+
+    elif gi_split:
+        gender_setting = '{}%_female'.format(female_perc_in_training)
+        run_config = '{}{}-lr{}-ep{}-pt{}-aug{}-VP{}-GIsplit-{}-Fold{}-imgs{}-mpara{}'.format(model_name,
+                                                                                              model_scale,
+                                                                                              lr,
+                                                                                              epochs,
+                                                                                              int(pretrained),
+                                                                                              int(augmentation),
+                                                                                              view_position,
+                                                                                              gender_setting,
+                                                                                              fold_num,
+                                                                                              image_size[0],
+                                                                                              int(save_model_para))
+    else:
+        run_config = '{}{}-sl{}-ep{}-lr{}-VP{}-SEX{}-mpara{}'.format(model_name, model_scale, str(single_label), epochs, lr,
+                                                             view_position, gender,
+                                                                     int(save_model_para))
+
+    print('------------------------------------------\n'*3)
+    print(run_config)
+
+     # Create output directory
     out_dir = '/work3/ninwe/run/chexpert/disease/' + run_config
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
     cur_version = get_cur_version(out_dir)
 
-    temp_dir = os.path.join(out_dir, 'temp_version_{}'.format(cur_version))
+    # data
+    if resam:
+        data=CheXpertDataResampleModule(img_data_dir=img_data_dir,
+                                csv_file_img=csv_file_img,
+                                image_size=image_size,
+                                pseudo_rgb=False,
+                                batch_size=batch_size,
+                                num_workers=num_workers,
+                                augmentation=augmentation,
+                                outdir=out_dir,
+                                version_no=cur_version,
+                                female_perc_in_training=female_perc_in_training,
+                                chose_disease=chose_disease_str,
+                                random_state=random_state,
+                                num_classes=num_classes,
+                                num_per_patient=num_per_patient
 
-    #temp_dir = os.path.join(out_dir, 'temp')
+        )
+    elif gi_split:
+        data = CheXpertGIDataModule(img_data_dir=img_data_dir,
+                                csv_file_img=csv_file_img,
+                                image_size=image_size,
+                                pseudo_rgb=False,
+                                batch_size=batch_size,
+                                num_workers=num_workers,
+                                augmentation=augmentation,
+                                view_position = view_position,
+                                vp_sample = view_position,
+                                only_gender=gender,
+                             save_split=True,
+                             outdir=out_dir,
+                             version_no=cur_version,
+                             gi_split=gi_split,
+                             gender_setting=gender_setting,
+                             fold_num=fold_num)
+    else:
+        data = CheXpertDataModule(csv_train_img='../datafiles/chexpert/chexpert.sample.train.csv',
+                                  csv_val_img='../datafiles/chexpert/chexpert.sample.val.csv',
+                                  csv_test_img='../datafiles/chexpert/chexpert.sample.test.csv',
+                                  image_size=image_size,
+                                  pseudo_rgb=True,
+                                  batch_size=batch_size,
+                                  num_workers=num_workers,
+                                  single_label=single_label,
+                                  view_position=view_position,
+                                  gender=gender,
+                                  outdir=out_dir,
+                                  version_no=cur_version)
+
+
+
+    # model
+    if model_name == 'densenet':
+        model_type = DenseNet
+    elif model_name == 'resnet':
+        model_type = ResNet
+    model = model_type(num_classes=num_classes,lr=lr,pretrained=pretrained,model_scale=model_scale)
+    model = model.to(device)
+
+
+    temp_dir = os.path.join(out_dir, 'temp_version_{}'.format(cur_version))
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
 
-    for idx in range(0,5):
-        sample = data.train_set.get_sample(idx)
-        imsave(os.path.join(temp_dir, 'sample_' + str(idx) + '.jpg'), sample['image'].astype(np.uint8))
+    for idx in range(0, 5):
+        if augmentation:
+            sample = data.train_set.exam_augmentation(idx)
+            sample = np.asarray(sample)
+            sample = np.transpose(sample, (2, 1, 0))
+            imsave(os.path.join(temp_dir, 'sample_' + str(idx) + '.png'), sample)
+        else:
+            sample = data.train_set.get_sample(idx)  # PIL
+            sample = np.asarray(sample['image'])
+            imsave(os.path.join(temp_dir, 'sample_' + str(idx) + '.png'), sample.astype(np.uint8))
 
     checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode='min')
 
     # train
     trainer = pl.Trainer(
-        callbacks=[checkpoint_callback],
-        log_every_n_steps = 5,
+        #callbacks=[checkpoint_callback],S
+        callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=3)],
+        log_every_n_steps = 1,
         max_epochs=epochs,
         gpus=hparams.gpus,
         logger=TensorBoardLogger('/work3/ninwe/run/chexpert/disease/', name=run_config,version=cur_version),
@@ -337,10 +404,12 @@ def main(hparams):
     trainer.logger._default_hp_metric = False
     trainer.fit(model, data)
 
-    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes)
+    model = model_type.load_from_checkpoint(trainer.checkpoint_callback.best_model_path, num_classes=num_classes,lr=lr,
+                                            pretrained=pretrained,model_scale=model_scale)
 
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
+    # use_cuda = torch.cuda.is_available()
+    # device = torch.device("cuda:" + str(hparams.dev) if use_cuda else "cpu")
+    # print('DEVICE:{}'.format(device))
 
     model.to(device)
 
@@ -366,21 +435,35 @@ def main(hparams):
     df.to_csv(os.path.join(out_dir, 'predictions.test.version_{}.csv'.format(cur_version)), index=False)
 
 
-    print('EMBEDDINGS')
+    if (True and resam):
+        print('TESTING on tain set')
+        # trainloader need to be non shuffled!
+        preds_test, targets_test, logits_test = test(model, data.train_dataloader_nonshuffle(), device)
+        df = pd.DataFrame(data=preds_test, columns=cols_names_classes)
+        df_logits = pd.DataFrame(data=logits_test, columns=cols_names_logits)
+        df_targets = pd.DataFrame(data=targets_test, columns=cols_names_targets)
+        df = pd.concat([df, df_logits, df_targets], axis=1)
+        df.to_csv(os.path.join(out_dir, 'predictions.train.version_{}.csv'.format(cur_version)), index=False)
 
-    model.remove_head()
+    # print('EMBEDDINGS')
+    #
+    # model.remove_head()
+    #
+    # embeds_val, targets_val = embeddings(model, data.val_dataloader(), device)
+    # df = pd.DataFrame(data=embeds_val)
+    # df_targets = pd.DataFrame(data=targets_val, columns=cols_names_targets)
+    # df = pd.concat([df, df_targets], axis=1)
+    # df.to_csv(os.path.join(out_dir, 'embeddings.val.version_{}.csv'.format(cur_version)), index=False)
+    #
+    # embeds_test, targets_test = embeddings(model, data.test_dataloader(), device)
+    # df = pd.DataFrame(data=embeds_test)
+    # df_targets = pd.DataFrame(data=targets_test, columns=cols_names_targets)
+    # df = pd.concat([df, df_targets], axis=1)
+    # df.to_csv(os.path.join(out_dir, 'embeddings.test.version_{}.csv'.format(cur_version)), index=False)
 
-    embeds_val, targets_val = embeddings(model, data.val_dataloader(), device)
-    df = pd.DataFrame(data=embeds_val)
-    df_targets = pd.DataFrame(data=targets_val, columns=cols_names_targets)
-    df = pd.concat([df, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'embeddings.val.version_{}.csv'.format(cur_version)), index=False)
-
-    embeds_test, targets_test = embeddings(model, data.test_dataloader(), device)
-    df = pd.DataFrame(data=embeds_test)
-    df_targets = pd.DataFrame(data=targets_test, columns=cols_names_targets)
-    df = pd.concat([df, df_targets], axis=1)
-    df.to_csv(os.path.join(out_dir, 'embeddings.test.version_{}.csv'.format(cur_version)), index=False)
+    if save_model_para == False:
+        model_para_dir = os.path.join(out_dir,'version_{}'.format(cur_version))
+        shutil.rmtree(model_para_dir)
 
 
 if __name__ == '__main__':
@@ -388,8 +471,18 @@ if __name__ == '__main__':
     parser.add_argument('--gpus', default=1)
     parser.add_argument('--dev', default=0)
     args = parser.parse_args()
-    
-    print('CONFIG: {}'.format(run_config))
-    exp_num = 5
-    for i in tqdm(range(exp_num)):
-        main(args)
+
+    print('START!')
+
+    if resam:
+        print('***********RESAMPLING EXPERIMENT**********\n' * 5)
+        for d in disease_list:
+            for female_perc_in_training in female_perc_in_training_set:
+                for i in random_state_set:
+                    main(args, female_perc_in_training=female_perc_in_training, random_state=i, chose_disease_str=d)
+    elif gi_split:
+        print('***********GI SPLIT EXPERIMENT**********\n' * 5)
+        for f_perc in female_perc_in_training_set:
+            for fold_i in fold_nums:
+                main(args, female_perc_in_training=f_perc, fold_num=fold_i)
+
